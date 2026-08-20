@@ -17,6 +17,46 @@ logging.basicConfig(
 )
 
 from sanitize_output import evaluate_sanitize_output
+from corroborate import evaluate_corroboration
+
+# ============================================================
+# Corroborate endpoint
+# ============================================================
+
+@app.get("/corroborate")
+@app.get("/corroborate/")
+def corroborate_info():
+    return jsonify({
+        "status": "ok",
+        "service": "corroborate",
+        "method": "POST",
+    })
+
+
+@app.post("/corroborate")
+@app.post("/corroborate/")
+def corroborate():
+    request_id = uuid.uuid4().hex[:12]
+
+    data = request.get_json(force=True, silent=True)
+    log_payload(
+        "corroborate",
+        request_id,
+        data,
+    )
+
+    result = evaluate_corroboration(data)
+
+    app.logger.info(
+        "corroborate request_id=%s verdict=%s confidence=%s sources=%s",
+        request_id,
+        result["verdict"],
+        result["confidence"],
+        result["corroboratingSources"],
+    )
+
+    return jsonify(result)
+
 
 # ============================================================
 # Model-output sink sanitizer endpoint
@@ -1014,6 +1054,7 @@ def health():
             "/action-firewall",
             "/terraform/plan",
             "/sanitize-output",
+            "/corroborate",
         ],
     })
 

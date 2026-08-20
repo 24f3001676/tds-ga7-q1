@@ -16,376 +16,19 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
+from sanitize_output import evaluate_sanitize_output
+
 # ============================================================
-# Model-output sink sanitizer
+# Model-output sink sanitizer endpoint
 # ============================================================
 
-SANITIZE_CHANNELS = {
-    "html",
-    "markdown",
-    "url",
-    "sql",
-    "shell",
-}
-
-ALLOWED_EXTERNAL_HOSTS = {
-    "cdn-0nl2whi.example",
-    "app-a2ytvc7.example",
-}
-
-SANITIZE_REASONS = {
-    "SAFE",
-    "INVALID_SCHEMA",
-    "SCRIPT_TAG",
-    "EVENT_HANDLER",
-    "DANGEROUS_SCHEME",
-    "EXTERNAL_EXFIL",
-    "SQL_METACHAR",
-    "SHELL_METACHAR",
-    "ENCODED_PAYLOAD",
-}
-
-NAMED_ENTITIES = {
-    "&lt;": "<",
-    "&gt;": ">",
-    "&quot;": '"',
-    "&apos;": "'",
-    "&amp;": "&",
-}
-
-NUMERIC_ENTITY_RE = re.compile(
-    r"&#(?:([0-9]+)|[xX]([0-9a-fA-F]+));"
-)
-
-
-def decode_html_entities_exact(value):
-    # Decode only the five explicitly allowed named entities.
-    for entity, replacement in NAMED_ENTITIES.items():
-        value = value.replace(entity, replacement)
-
-    # Decode only semicolon-terminated decimal/hex numeric entities.
-    def replace_numeric(match):
-        decimal = match.group(1)
-        hexadecimal = match.group(2)
-
-        try:
-            codepoint = (
-                int(decimal, 10)
-                if decimal is not None
-                else int(hexadecimal, 16)
-            )
-
-            # Keep this conservative: invalid Unicode code points
-            # remain unchanged.
-            if codepoint > 0x10FFFF:
-                return match.group(0)
-
-            return chr(codepoint)
-
-        except (ValueError, OverflowError):
-            return match.group(0)
-
-    return NUMERIC_ENTITY_RE.sub(replace_numeric, value)
-
-
-def decode_once(value):
-    # Exactly the order required by the specification.
-    decoded = unquote(value)
-    decoded = decode_html_entities_exact(decoded)
-
-    # Decode literal \uXXXX exactly once.
-    decoded = re.sub(
-        r"\\u([0-9a-fA-F]{4})",
-        lambda m: chr(int(m.group(1), 16)),
-        decoded,
-    )
-
-    return decoded
-
-# Opening dangerous HTML tags only.
-HTML_SCRIPT_TAG_RE = re.compile(
-    r"<\s*(?:script|iframe|object|embed)\b[^>]*>",
-    re.IGNORECASE,
-)
-
-# Any HTML attribute beginning with "on", e.g. onclick=,
-# onerror=, onload=, etc.
-HTML_TAG_RE = re.compile(
-    r"<[^>]*>",
-    re.IGNORECASE | re.DOTALL,
-)
-
-HTML_EVENT_HANDLER_RE = re.compile(
-    r"\bon[a-zA-Z][a-zA-Z0-9_-]*\s*=",
-    re.IGNORECASE,
-)
-
-
-def has_html_event_handler(output):
-    for tag in HTML_TAG_RE.finditer(output):
-        tag_text = tag.group(0)
-
-        # Skip closing tags such as </div>.
-        if re.match(r"<\s*/", tag_text):
-            continue
-
-        if HTML_EVENT_HANDLER_RE.search(tag_text):
-            return True
-
-    return False
-
-# Dangerous schemes anywhere in the text.
-DANGEROUS_SCHEME_RE = re.compile(
-    r"(?:javascript|data|vbscript)\s*:",
-    re.IGNORECASE,
-)
-
-# HTML quoted src/href.
-HTML_URL_RE = re.compile(
-    r"""
-    \b(?:src|href)
-    \s*=\s*
-    (?P<quote>["'])
-    (?P<url>.*?)
-    (?P=quote)
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-# Markdown target inside ](...)
-#
-# This deliberately captures the destination at the start of the
-# parenthesized target, including optional angle brackets.
-MARKDOWN_URL_RE = re.compile(
-    r"""
-    \]\(
-    \s*
-    (?:<(?P<angle>[^>]+)>|(?P<plain>\S+?))
-    (?:\s+["'][^)]*["'])?
-    \s*
-    \)
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-# SQL rules.
-SQL_SINGLE_OR_DOUBLE_QUOTE_RE = re.compile(r"""['"]""")
-SQL_SEMICOLON_RE = re.compile(r";")
-SQL_COMMENT_RE = re.compile(r"--|/\*")
-SQL_UNION_RE = re.compile(r"\bunion\b", re.IGNORECASE)
-SQL_OR_1_EQ_1_RE = re.compile(r"\bor\s+1\s*=\s*1\b", re.IGNORECASE)
-
-# Shell metacharacters.
-SHELL_METACHAR_RE = re.compile(
-    r"[;&|`<>]|\$\(|\$\{"
-)
-
-
-def extract_urls(channel, output):
-    """
-    Extract URLs according to the assignment's channel-specific rules.
-
-    html:
-      quoted src= and href=
-
-    markdown:
-      target inside ](...)
-
-    url:
-      whole trimmed output
-    """
-    if channel == "html":
-        return [
-            match.group("url")
-            for match in HTML_URL_RE.finditer(output)
-        ]
-
-    if channel == "markdown":
-        urls = []
-
-        for match in MARKDOWN_URL_RE.finditer(output):
-            angle = match.group("angle")
-            plain = match.group("plain")
-
-            if angle is not None:
-                urls.append(angle)
-            elif plain is not None:
-                urls.append(plain)
-
-        return urls
-
-    if channel == "url":
-        trimmed = output.strip()
-        return [trimmed] if trimmed else []
-
-    return []
-
-
-def url_has_dangerous_scheme(url):
-    """
-    Check the extracted URL itself.
-
-    A URL is dangerous when:
-      - scheme is not http/https
-      - scheme is javascript/data/vbscript
-      - protocol-relative //host/path is treated as https
-    """
-    candidate = url.strip()
-
-    if not candidate:
-        return False
-
-    # Explicit dangerous textual schemes.
-    if DANGEROUS_SCHEME_RE.search(candidate):
-        return True
-
-    # Relative references are fine.
-    if candidate.startswith("/"):
-        # //host/path is protocol-relative and therefore absolute.
-        if candidate.startswith("//"):
-            parsed = urlparse("https:" + candidate)
-            return parsed.scheme.lower() != "https"
-        return False
-
-    parsed = urlparse(candidate)
-
-    # No scheme = relative reference.
-    if not parsed.scheme:
-        return False
-
-    return parsed.scheme.lower() not in {"http", "https"}
-
-
-def has_external_exfil(channel, output):
-    """
-    Check every extracted absolute URL.
-
-    Compare parsed hostname exactly. Never use substring checks.
-    """
-    urls = extract_urls(channel, output)
-
-    for candidate in urls:
-        value = candidate.strip()
-
-        if not value:
-            continue
-
-        # Protocol-relative URL => treat as https.
-        if value.startswith("//"):
-            parsed = urlparse("https:" + value)
-        else:
-            parsed = urlparse(value)
-
-        # Relative URL is allowed.
-        if not parsed.scheme and not value.startswith("//"):
-            continue
-
-        # At this point the extracted URL is absolute.
-        hostname = parsed.hostname
-
-        if hostname is None:
-            continue
-
-        if hostname not in ALLOWED_EXTERNAL_HOSTS:
-            return True
-
-    return False
-
-
-def dangerous_scheme_check(channel, output):
-    """
-    Channel-independent dangerous-scheme check.
-    """
-    # Direct textual scheme use anywhere.
-    if DANGEROUS_SCHEME_RE.search(output):
-        return True
-
-    # Extracted URLs may contain arbitrary schemes.
-    for candidate in extract_urls(channel, output):
-        if url_has_dangerous_scheme(candidate):
-            return True
-
-    return False
-
-
-def channel_rule(output, channel):
-    """
-    Apply the channel rules to the ORIGINAL output.
-    Returns the first applicable reason or SAFE.
-    """
-
-    # HTML:
-    # SCRIPT_TAG -> EVENT_HANDLER -> DANGEROUS_SCHEME -> EXTERNAL_EXFIL
-    if channel == "html":
-        if HTML_SCRIPT_TAG_RE.search(output):
-            return "SCRIPT_TAG"
-
-        if has_html_event_handler(output):
-            return "EVENT_HANDLER"
-
-        if dangerous_scheme_check(channel, output):
-            return "DANGEROUS_SCHEME"
-
-        if has_external_exfil(channel, output):
-            return "EXTERNAL_EXFIL"
-
-        return "SAFE"
-
-    # Markdown:
-    # DANGEROUS_SCHEME -> EXTERNAL_EXFIL
-    if channel == "markdown":
-        if dangerous_scheme_check(channel, output):
-            return "DANGEROUS_SCHEME"
-
-        if has_external_exfil(channel, output):
-            return "EXTERNAL_EXFIL"
-
-        return "SAFE"
-
-    # URL:
-    # DANGEROUS_SCHEME -> EXTERNAL_EXFIL
-    if channel == "url":
-        if dangerous_scheme_check(channel, output):
-            return "DANGEROUS_SCHEME"
-
-        if has_external_exfil(channel, output):
-            return "EXTERNAL_EXFIL"
-
-        return "SAFE"
-
-    # SQL
-    if channel == "sql":
-        if SQL_SINGLE_OR_DOUBLE_QUOTE_RE.search(output):
-            return "SQL_METACHAR"
-
-        if SQL_SEMICOLON_RE.search(output):
-            return "SQL_METACHAR"
-
-        if SQL_COMMENT_RE.search(output):
-            return "SQL_METACHAR"
-
-        if SQL_UNION_RE.search(output):
-            return "SQL_METACHAR"
-
-        if SQL_OR_1_EQ_1_RE.search(output):
-            return "SQL_METACHAR"
-
-        return "SAFE"
-
-    # Shell
-    if channel == "shell":
-        if SHELL_METACHAR_RE.search(output):
-            return "SHELL_METACHAR"
-
-        return "SAFE"
-
-    return "INVALID_SCHEMA"
-
-
-def sanitize_result(safe, reason):
+@app.get("/sanitize-output")
+@app.get("/sanitize-output/")
+def sanitize_output_info():
     return jsonify({
-        "safe": safe,
-        "reason": reason,
+        "status": "ok",
+        "service": "sanitize-output",
+        "method": "POST",
     })
 
 
@@ -395,118 +38,22 @@ def sanitize_output():
     request_id = uuid.uuid4().hex[:12]
 
     data = request.get_json(force=True, silent=True)
-
-    # Log the request for Render debugging.
-    # Output itself is not a secret by definition, so it is logged
-    # normally through the shared logging helper.
     log_payload(
         "sanitize_output",
         request_id,
         data,
     )
 
-    # ========================================================
-    # 1. INVALID_SCHEMA
-    # ========================================================
-
-    if not isinstance(data, dict):
-        result = sanitize_result(False, "INVALID_SCHEMA")
-
-        app.logger.info(
-            "sanitize_output request_id=%s safe=false reason=INVALID_SCHEMA",
-            request_id,
-        )
-
-        return result
-
-    channel = data.get("channel")
-    output = data.get("output")
-
-    if channel not in SANITIZE_CHANNELS:
-        result = sanitize_result(False, "INVALID_SCHEMA")
-
-        app.logger.info(
-            "sanitize_output request_id=%s safe=false reason=INVALID_SCHEMA",
-            request_id,
-        )
-
-        return result
-
-    if not isinstance(output, str):
-        result = sanitize_result(False, "INVALID_SCHEMA")
-
-        app.logger.info(
-            "sanitize_output request_id=%s safe=false reason=INVALID_SCHEMA",
-            request_id,
-        )
-
-        return result
-
-    if len(output) > 20000:
-        result = sanitize_result(False, "INVALID_SCHEMA")
-
-        app.logger.info(
-            "sanitize_output request_id=%s safe=false reason=INVALID_SCHEMA",
-            request_id,
-        )
-
-        return result
-
-    # ========================================================
-    # 2. ENCODED_PAYLOAD
-    # ========================================================
-
-    decoded = decode_once(output)
-
-    if decoded != output:
-        decoded_reason = channel_rule(decoded, channel)
-
-        if decoded_reason != "SAFE":
-            result = sanitize_result(
-                False,
-                "ENCODED_PAYLOAD",
-            )
-
-            app.logger.info(
-                "sanitize_output request_id=%s channel=%s safe=false reason=ENCODED_PAYLOAD decoded_rule=%s",
-                request_id,
-                channel,
-                decoded_reason,
-            )
-
-            return result
-
-    # ========================================================
-    # 3. ORIGINAL OUTPUT CHANNEL RULES
-    # ========================================================
-
-    reason = channel_rule(output, channel)
-
-    if reason != "SAFE":
-        result = sanitize_result(False, reason)
-
-        app.logger.info(
-            "sanitize_output request_id=%s channel=%s safe=false reason=%s",
-            request_id,
-            channel,
-            reason,
-        )
-
-        return result
-
-    # ========================================================
-    # SAFE
-    # ========================================================
-
-    result = sanitize_result(True, "SAFE")
+    result = evaluate_sanitize_output(data)
 
     app.logger.info(
-        "sanitize_output request_id=%s channel=%s safe=true reason=SAFE",
+        "sanitize_output request_id=%s safe=%s reason=%s",
         request_id,
-        channel,
+        result["safe"],
+        result["reason"],
     )
 
-    return result
+    return jsonify(result)
 
 # ============================================================
 # Existing release-gate configuration
@@ -1465,6 +1012,8 @@ def health():
         "endpoints": [
             "/release-gate",
             "/action-firewall",
+            "/terraform/plan",
+            "/sanitize-output",
         ],
     })
 

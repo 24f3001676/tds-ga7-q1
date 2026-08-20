@@ -419,16 +419,6 @@ def sanitize_output():
 
         return result
 
-    if set(data.keys()) != {"channel", "output"}:
-        result = sanitize_result(False, "INVALID_SCHEMA")
-
-        app.logger.info(
-            "sanitize_output request_id=%s safe=false reason=INVALID_SCHEMA",
-            request_id,
-        )
-
-        return result
-
     channel = data.get("channel")
     output = data.get("output")
 

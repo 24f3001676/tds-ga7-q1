@@ -394,7 +394,7 @@ def sanitize_result(safe, reason):
 def sanitize_output():
     request_id = uuid.uuid4().hex[:12]
 
-    data = request.get_json(silent=True)
+    data = request.get_json(force=True, silent=True)
 
     # Log the request for Render debugging.
     # Output itself is not a secret by definition, so it is logged

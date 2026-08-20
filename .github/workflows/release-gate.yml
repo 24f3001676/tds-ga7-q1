@@ -1,0 +1,149 @@
+name: TDS GA7 Release Gate
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+  id-token: none
+
+jobs:
+  test-release-gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: TDS identity: 24f3001676@ds.study.iitm.ac.in
+        run: |
+          echo "TDS GA7 Release Gate"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Start service
+        run: |
+          gunicorn app:app --bind 127.0.0.1:5000 &
+          sleep 3
+
+      - name: Test safe request
+        run: |
+          RESPONSE=$(curl -s \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d '{
+              "target": "production",
+              "event": "push",
+              "ref": "refs/heads/main",
+              "workflow": {
+                "trigger": "push",
+                "permissions": {
+                  "contents": "read",
+                  "packages": "write",
+                  "id-token": "none"
+                },
+                "testsPassed": true,
+                "matrixComplete": true,
+                "failFast": false,
+                "environmentApproval": true,
+                "actions": [
+                  {
+                    "owner": "actions",
+                    "name": "checkout",
+                    "ref": "v4"
+                  },
+                  {
+                    "owner": "example",
+                    "name": "build",
+                    "ref": "0123456789abcdef0123456789abcdef01234567"
+                  }
+                ]
+              },
+              "image": {
+                "multiStage": true,
+                "runsAsRoot": false,
+                "secretMode": "buildkit",
+                "criticalVulnerabilities": 0,
+                "digestPinned": true
+              }
+            }' \
+            http://127.0.0.1:5000/release-gate)
+
+          echo "$RESPONSE"
+
+          python -c '
+          import json, sys
+          x = json.loads(sys.argv[1])
+          assert x["decision"] == "promote", x
+          assert x["violations"] == [], x
+          ' "$RESPONSE"
+
+      - name: Test unsafe request
+        run: |
+          RESPONSE=$(curl -s \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d '{
+              "target": "production",
+              "event": "push",
+              "ref": "refs/heads/dev",
+              "workflow": {
+                "trigger": "push",
+                "permissions": {
+                  "contents": "write",
+                  "packages": "write",
+                  "id-token": "write",
+                  "issues": "write"
+                },
+                "testsPassed": false,
+                "matrixComplete": false,
+                "failFast": true,
+                "environmentApproval": false,
+                "actions": [
+                  {
+                    "owner": "someone",
+                    "name": "build",
+                    "ref": "v1"
+                  }
+                ]
+              },
+              "image": {
+                "multiStage": false,
+                "runsAsRoot": true,
+                "secretMode": "copy",
+                "criticalVulnerabilities": 3,
+                "digestPinned": false
+              }
+            }' \
+            http://127.0.0.1:5000/release-gate)
+
+          echo "$RESPONSE"
+
+          python -c '
+          import json, sys
+          x = json.loads(sys.argv[1])
+          expected = {
+              "EXCESS_PERMISSION",
+              "TESTS_INCOMPLETE",
+              "MUTABLE_ACTION",
+              "SINGLE_STAGE_IMAGE",
+              "ROOT_RUNTIME",
+              "SECRET_IN_LAYER",
+              "CRITICAL_CVE",
+              "UNPINNED_IMAGE",
+              "INVALID_PRODUCTION_REF",
+              "APPROVAL_REQUIRED",
+          }
+          assert x["decision"] == "block", x
+          assert set(x["violations"]) == expected, x
+          ' "$RESPONSE"

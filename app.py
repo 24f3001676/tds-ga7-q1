@@ -162,6 +162,38 @@ def exact_keys(obj, required_keys):
     )
 
 
+# ============================================================
+# Terraform plan policy
+# ============================================================
+
+TERRAFORM_WORKSPACE = "prod-ujxf2x"
+
+REQUIRED_LABELS = {
+    "owner": "student-dx2lj",
+    "environment": "production",
+    "cost_center": "cc-nc6s",
+}
+
+ALLOWED_BACKENDS = {
+    "gcs",
+    "s3",
+    "azurerm",
+    "remote",
+}
+
+ALLOWED_PROVIDER_VERSIONS = {
+    "6.2.1",
+    "= 6.2.1",
+    "~> 6.0",
+}
+
+DESTRUCTIVE_RESOURCE_TYPES = {
+    "storage_bucket",
+    "sql_database",
+    "persistent_disk",
+}
+
+
 # ------------------------------------------------------------
 # HTML safety
 # ------------------------------------------------------------
@@ -291,6 +323,320 @@ def validate_render_html_args(args):
 # ============================================================
 # Action firewall
 # ============================================================
+# ============================================================
+# Terraform plan policy
+# ============================================================
+
+def terraform_result(decision, reason):
+    return jsonify({
+        "decision": decision,
+        "reason": reason,
+    })
+
+
+@app.post("/terraform/plan")
+@app.post("/terraform/plan/")
+def terraform_plan():
+    request_id = uuid.uuid4().hex[:12]
+
+    data = request.get_json(silent=True)
+
+    # IMPORTANT:
+    # Do not log plaintext secrets. The shared logger recursively
+    # redacts keys named "secret", but resource.secret itself is
+    # not a dictionary key containing a secret field. Therefore
+    # create a sanitized copy specifically for this endpoint.
+    log_data = data
+
+    if isinstance(data, dict):
+        try:
+            log_data = json.loads(json.dumps(data))
+            resource_for_log = log_data.get("resource")
+
+            if isinstance(resource_for_log, dict) and "secret" in resource_for_log:
+                resource_for_log["secret"] = (
+                    "[REDACTED]" if resource_for_log["secret"] is not None
+                    else None
+                )
+        except Exception:
+            log_data = "[UNLOGGABLE_PAYLOAD]"
+
+    log_payload(
+        "terraform_plan",
+        request_id,
+        log_data,
+    )
+
+    # ========================================================
+    # 1. REQUEST / NESTED OBJECT VALUE TYPES
+    # ========================================================
+
+    if not isinstance(data, dict):
+        result = terraform_result("reject", "INVALID_PLAN")
+
+        app.logger.info(
+            "terraform_plan request_id=%s decision=reject reason=INVALID_PLAN",
+            request_id,
+        )
+
+        return result
+
+    # Exact top-level structure.
+    if set(data.keys()) != {
+        "environment",
+        "state",
+        "providerVersion",
+        "destroyApproved",
+        "resource",
+    }:
+        result = terraform_result("reject", "INVALID_PLAN")
+
+        app.logger.info(
+            "terraform_plan request_id=%s decision=reject reason=INVALID_PLAN",
+            request_id,
+        )
+
+        return result
+
+    # Top-level types.
+    if not isinstance(data["environment"], str):
+        return terraform_result("reject", "INVALID_PLAN")
+
+    if not isinstance(data["state"], dict):
+        return terraform_result("reject", "INVALID_PLAN")
+
+    if not isinstance(data["providerVersion"], str):
+        return terraform_result("reject", "INVALID_PLAN")
+
+    if not isinstance(data["destroyApproved"], bool):
+        return terraform_result("reject", "INVALID_PLAN")
+
+    if not isinstance(data["resource"], dict):
+        return terraform_result("reject", "INVALID_PLAN")
+
+    # State must have exactly the shown fields.
+    state = data["state"]
+
+    if set(state.keys()) != {"backend", "locked"}:
+        return terraform_result("reject", "INVALID_PLAN")
+
+    if not isinstance(state["backend"], str):
+        return terraform_result("reject", "INVALID_PLAN")
+
+    if not isinstance(state["locked"], bool):
+        return terraform_result("reject", "INVALID_PLAN")
+
+    # Resource must have exactly the shown fields.
+    resource = data["resource"]
+
+    if set(resource.keys()) != {
+        "address",
+        "type",
+        "action",
+        "labels",
+        "secret",
+        "forceDestroy",
+    }:
+        return terraform_result("reject", "INVALID_PLAN")
+
+    if not isinstance(resource["address"], str):
+        return terraform_result("reject", "INVALID_PLAN")
+
+    if not isinstance(resource["type"], str):
+        return terraform_result("reject", "INVALID_PLAN")
+
+    if resource["action"] not in {"create", "update", "delete"}:
+        return terraform_result("reject", "INVALID_PLAN")
+
+    if not isinstance(resource["labels"], dict):
+        return terraform_result("reject", "INVALID_PLAN")
+
+    if any(
+        not isinstance(k, str) or not isinstance(v, str)
+        for k, v in resource["labels"].items()
+    ):
+        return terraform_result("reject", "INVALID_PLAN")
+
+    if resource["secret"] is not None and not isinstance(resource["secret"], str):
+        return terraform_result("reject", "INVALID_PLAN")
+
+    if not isinstance(resource["forceDestroy"], bool):
+        return terraform_result("reject", "INVALID_PLAN")
+
+    # ========================================================
+    # 2. ENVIRONMENT
+    # ========================================================
+
+    if data["environment"] != TERRAFORM_WORKSPACE:
+        result = terraform_result(
+            "reject",
+            "ENVIRONMENT_MISMATCH",
+        )
+
+        app.logger.info(
+            "terraform_plan request_id=%s decision=reject reason=ENVIRONMENT_MISMATCH",
+            request_id,
+        )
+
+        return result
+
+    # ========================================================
+    # 3. REMOTE STATE
+    # ========================================================
+
+    if (
+        state["backend"] not in ALLOWED_BACKENDS
+        or state["locked"] is not True
+    ):
+        result = terraform_result(
+            "reject",
+            "STATE_UNSAFE",
+        )
+
+        app.logger.info(
+            "terraform_plan request_id=%s decision=reject reason=STATE_UNSAFE",
+            request_id,
+        )
+
+        return result
+
+    # ========================================================
+    # 4. PROVIDER VERSION
+    # ========================================================
+
+    if data["providerVersion"] not in ALLOWED_PROVIDER_VERSIONS:
+        result = terraform_result(
+            "reject",
+            "UNPINNED_PROVIDER",
+        )
+
+        app.logger.info(
+            "terraform_plan request_id=%s decision=reject reason=UNPINNED_PROVIDER providerVersion=%s",
+            request_id,
+            data["providerVersion"],
+        )
+
+        return result
+
+    # ========================================================
+    # 5. REQUIRED COST-OWNERSHIP LABELS
+    # ========================================================
+
+    labels = resource["labels"]
+
+    for key, expected_value in REQUIRED_LABELS.items():
+        if labels.get(key) != expected_value:
+            result = terraform_result(
+                "reject",
+                "MISSING_LABELS",
+            )
+
+            app.logger.info(
+                "terraform_plan request_id=%s decision=reject reason=MISSING_LABELS",
+                request_id,
+            )
+
+            return result
+
+    # ========================================================
+    # 6. SECRET REPRESENTATION
+    # ========================================================
+
+    secret = resource["secret"]
+
+    if secret is not None:
+        if not isinstance(secret, str):
+            return terraform_result(
+                "reject",
+                "INVALID_PLAN",
+            )
+
+        if not secret.startswith("secret://"):
+            result = terraform_result(
+                "reject",
+                "PLAINTEXT_SECRET",
+            )
+
+            app.logger.info(
+                "terraform_plan request_id=%s decision=reject reason=PLAINTEXT_SECRET",
+                request_id,
+            )
+
+            return result
+
+        # "secret://..." means the portion after the prefix
+        # must not be empty.
+        if len(secret) <= len("secret://"):
+            result = terraform_result(
+                "reject",
+                "PLAINTEXT_SECRET",
+            )
+
+            app.logger.info(
+                "terraform_plan request_id=%s decision=reject reason=PLAINTEXT_SECRET",
+                request_id,
+            )
+
+            return result
+
+    # ========================================================
+    # 7. DESTRUCTIVE DELETE
+    # ========================================================
+
+    if (
+        resource["action"] == "delete"
+        and resource["type"] in DESTRUCTIVE_RESOURCE_TYPES
+        and data["destroyApproved"] is not True
+    ):
+        result = terraform_result(
+            "reject",
+            "DELETE_NOT_APPROVED",
+        )
+
+        app.logger.info(
+            "terraform_plan request_id=%s decision=reject reason=DELETE_NOT_APPROVED resource_type=%s",
+            request_id,
+            resource["type"],
+        )
+
+        return result
+
+    # ========================================================
+    # 8. PRODUCTION STORAGE BUCKET FORCE DESTROY
+    # ========================================================
+
+    if (
+        resource["type"] == "storage_bucket"
+        and resource["forceDestroy"] is True
+    ):
+        result = terraform_result(
+            "reject",
+            "FORCE_DESTROY",
+        )
+
+        app.logger.info(
+            "terraform_plan request_id=%s decision=reject reason=FORCE_DESTROY",
+            request_id,
+        )
+
+        return result
+
+    # ========================================================
+    # APPROVE
+    # ========================================================
+
+    result = terraform_result(
+        "approve",
+        "APPROVE",
+    )
+
+    app.logger.info(
+        "terraform_plan request_id=%s decision=approve reason=APPROVE",
+        request_id,
+    )
+
+    return result
+
 
 @app.post("/action-firewall")
 @app.post("/action-firewall/")

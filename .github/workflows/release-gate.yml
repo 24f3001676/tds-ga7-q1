@@ -18,7 +18,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: TDS identity: 24f3001676@ds.study.iitm.ac.in
+      - name: "TDS identity: 24f3001676@ds.study.iitm.ac.in"
         run: |
           echo "TDS GA7 Release Gate"
 
@@ -29,6 +29,7 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Start service
@@ -36,9 +37,14 @@ jobs:
           gunicorn app:app --bind 127.0.0.1:5000 &
           sleep 3
 
-      - name: Test safe request
+      - name: Test health endpoint
         run: |
-          RESPONSE=$(curl -s \
+          curl --fail --show-error http://127.0.0.1:5000/
+          curl --fail --show-error http://127.0.0.1:5000/release-gate
+
+      - name: Test safe production request
+        run: |
+          RESPONSE=$(curl -sS \
             -X POST \
             -H "Content-Type: application/json" \
             -d '{
@@ -83,14 +89,14 @@ jobs:
 
           python -c '
           import json, sys
-          x = json.loads(sys.argv[1])
-          assert x["decision"] == "promote", x
-          assert x["violations"] == [], x
+          result = json.loads(sys.argv[1])
+          assert result["decision"] == "promote", result
+          assert result["violations"] == [], result
           ' "$RESPONSE"
 
-      - name: Test unsafe request
+      - name: Test unsafe multi-failure request
         run: |
-          RESPONSE=$(curl -s \
+          RESPONSE=$(curl -sS \
             -X POST \
             -H "Content-Type: application/json" \
             -d '{
@@ -131,7 +137,9 @@ jobs:
 
           python -c '
           import json, sys
-          x = json.loads(sys.argv[1])
+
+          result = json.loads(sys.argv[1])
+
           expected = {
               "EXCESS_PERMISSION",
               "TESTS_INCOMPLETE",
@@ -144,6 +152,7 @@ jobs:
               "INVALID_PRODUCTION_REF",
               "APPROVAL_REQUIRED",
           }
-          assert x["decision"] == "block", x
-          assert set(x["violations"]) == expected, x
+
+          assert result["decision"] == "block", result
+          assert set(result["violations"]) == expected, result
           ' "$RESPONSE"

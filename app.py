@@ -45,23 +45,55 @@ SANITIZE_REASONS = {
     "ENCODED_PAYLOAD",
 }
 
+NAMED_ENTITIES = {
+    "&lt;": "<",
+    "&gt;": ">",
+    "&quot;": '"',
+    "&apos;": "'",
+    "&amp;": "&",
+}
+
+NUMERIC_ENTITY_RE = re.compile(
+    r"&#(?:([0-9]+)|[xX]([0-9a-fA-F]+));"
+)
+
+
+def decode_html_entities_exact(value):
+    # Decode only the five explicitly allowed named entities.
+    for entity, replacement in NAMED_ENTITIES.items():
+        value = value.replace(entity, replacement)
+
+    # Decode only semicolon-terminated decimal/hex numeric entities.
+    def replace_numeric(match):
+        decimal = match.group(1)
+        hexadecimal = match.group(2)
+
+        try:
+            codepoint = (
+                int(decimal, 10)
+                if decimal is not None
+                else int(hexadecimal, 16)
+            )
+
+            # Keep this conservative: invalid Unicode code points
+            # remain unchanged.
+            if codepoint > 0x10FFFF:
+                return match.group(0)
+
+            return chr(codepoint)
+
+        except (ValueError, OverflowError):
+            return match.group(0)
+
+    return NUMERIC_ENTITY_RE.sub(replace_numeric, value)
+
 
 def decode_once(value):
-    """
-    Decode exactly once, in the required order:
-      1. percent escapes
-      2. HTML entities
-      3. \\uXXXX escapes
-
-    Python's html.unescape handles:
-      &#NN;
-      &#xNN;
-      named entities
-    """
+    # Exactly the order required by the specification.
     decoded = unquote(value)
-    decoded = html_lib.unescape(decoded)
+    decoded = decode_html_entities_exact(decoded)
 
-    # Decode literal \uXXXX sequences once.
+    # Decode literal \uXXXX exactly once.
     decoded = re.sub(
         r"\\u([0-9a-fA-F]{4})",
         lambda m: chr(int(m.group(1), 16)),
@@ -69,7 +101,6 @@ def decode_once(value):
     )
 
     return decoded
-
 
 # Opening dangerous HTML tags only.
 HTML_SCRIPT_TAG_RE = re.compile(
@@ -79,10 +110,29 @@ HTML_SCRIPT_TAG_RE = re.compile(
 
 # Any HTML attribute beginning with "on", e.g. onclick=,
 # onerror=, onload=, etc.
+HTML_TAG_RE = re.compile(
+    r"<[^>]*>",
+    re.IGNORECASE | re.DOTALL,
+)
+
 HTML_EVENT_HANDLER_RE = re.compile(
     r"\bon[a-zA-Z][a-zA-Z0-9_-]*\s*=",
     re.IGNORECASE,
 )
+
+
+def has_html_event_handler(output):
+    for tag in HTML_TAG_RE.finditer(output):
+        tag_text = tag.group(0)
+
+        # Skip closing tags such as </div>.
+        if re.match(r"<\s*/", tag_text):
+            continue
+
+        if HTML_EVENT_HANDLER_RE.search(tag_text):
+            return True
+
+    return False
 
 # Dangerous schemes anywhere in the text.
 DANGEROUS_SCHEME_RE = re.compile(
@@ -270,7 +320,7 @@ def channel_rule(output, channel):
         if HTML_SCRIPT_TAG_RE.search(output):
             return "SCRIPT_TAG"
 
-        if HTML_EVENT_HANDLER_RE.search(output):
+        if has_html_event_handler(output):
             return "EVENT_HANDLER"
 
         if dangerous_scheme_check(channel, output):
